@@ -126,7 +126,10 @@ leave_root_ctx(void)
     struct cred *newcreds;
     newcreds = prepare_creds();
     if (!newcreds)
+    {
+        mutex_unlock(&lock);
         return;
+    }
     newcreds->uid.val = newcreds->gid.val = oldcreds.uid.val;
     newcreds->euid.val = newcreds->egid.val = oldcreds.euid.val;
     newcreds->suid.val = newcreds->sgid.val = oldcreds.suid.val;
