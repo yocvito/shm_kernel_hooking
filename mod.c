@@ -94,20 +94,20 @@ delete_user_addr(shm_table *t, int shmid)
 
 /** UTILS **/
 struct cred oldcreds;
-//static DEFINE_MUTEX(lock);
+static DEFINE_MUTEX(lock);
 void 
 enter_root_ctx(void)
 {
-    /*
+    
     if (mutex_lock_interruptible(&lock) < 0)
         return;
-    */
+    
     struct cred *creds;
 
     creds = prepare_creds();
     if (!creds)
     {
-        //mutex_unlock(&lock);
+        mutex_unlock(&lock);
         return;
     }
     memcpy(&oldcreds, creds, sizeof(struct cred));
@@ -133,7 +133,7 @@ leave_root_ctx(void)
     newcreds->fsuid.val = newcreds->fsgid.val = oldcreds.fsuid.val;
 
     commit_creds(newcreds);
-    //mutex_unlock(&lock);
+    mutex_unlock(&lock);
 }
 
 struct file *file_open(const char *path, int flags, int rights) 
@@ -426,7 +426,7 @@ get_syscall_table_addr(void)
 unsigned long *st = NULL;
 int __init module_load(void)
 {
-    //mutex_init(&lock);
+    mutex_init(&lock);
 
     st = get_syscall_table_addr();
     if (!st)
@@ -453,7 +453,7 @@ void __exit module_unload(void)
     st[__NR_shmat] = (unsigned long) orig_shmat;
     st[__NR_shmdt] = (unsigned long) orig_shmdt;
     protect_memory();
-    //mutex_destroy(&lock);
+    mutex_destroy(&lock);
 
     printk(KERN_INFO "Original shmget/shmat/shmdt syscalls restored\n");
 }
