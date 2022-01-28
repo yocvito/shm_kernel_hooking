@@ -1,22 +1,23 @@
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/proc_fs.h>
 #include <linux/ipc.h>
 #include <linux/syscalls.h>
 #include <linux/kprobes.h>
 #include <linux/string.h>
-#include <linux/slab.h>
 
-#include <linux/fs.h>
-#include <asm/segment.h>
-#include <asm/uaccess.h>
-#include <linux/buffer_head.h>
-#include <linux/fcntl.h>
-#include <asm/processor.h>
+#include <linux/time.h>
 
-#include <linux/mutex.h>
+#include <linux/uio.h>
+#include <linux/mman.h>
+
+// for scheduling dumping task
+#include <linux/workqueue.h>
+#include <linux/sched.h>
+
+
+#include "utils.h"
 
 long orig_cr0;
 
@@ -32,244 +33,48 @@ long orig_cr0;
 });
 
 #if defined(CONFIG_X86_64) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0))
-#define PTREGS_SYSCALL_STUBS 1
+#define PTREGS_SYSCALL_STUBS    1
 #endif
 
 #ifdef PTREGS_SYSCALL_STUBS
-#define SYSCALL_NAME(name) ("__x64_sys_" name)
+#define SYSCALL_NAME(name)      ("__x64_sys_" name)
 #else
-#define SYSCALL_NAME(name) ("sys_" name)
+#define SYSCALL_NAME(name)      ("sys_" name)
 #endif
 
-#define LOGFILE         "/var/tmp/.shmlogs"
+#define LOGGING_WAITING_TIMER   10
+struct timespec64 last = { 0 };
+static DEFINE_MUTEX(log_lock);
+int onexit = 0;
+static struct workqueue_struct *queue;
+static struct work_struct Task;
+static int dumping_routine(void*);
+static DECLARE_DELAYED_WORK(task, dumping_routine);
 
-/** SHM manipulation **/
-// not used yet
-typedef struct _shm_entry {
-    int shmid;
-    long size;
-    int nb_processes;
-    int array_max_size;             // user addresses array max size
-    int creator_pid;
-    char * __user *useraddrs;       // we cannot just store the userspace addr of creator because he can dettach 
-                                    // and the other processes attached could continue to write on this area without
-                                    // us able to see it.
 
-} shm_entry;
-
-typedef struct _shm_table {
-    int nb_shm_areas;
-    struct _shm_entry *infos;   
-} shm_table;
-
-shm_entry *
-alloc_entry(int shmid, long size)
-{
-    return NULL;
-}
-
-int
-add_entry(shm_table *t, shm_entry *e)
-{
-    return -1;
-}
-
-int
-delete_entry(shm_table *t, int shmid)
-{
-    return -1;
-}
-
-int
-add_user_addr(shm_table *t, int shmid, char * __user addr)
-{
-    return -1;
-}
-
-int
-delete_user_addr(shm_table *t, int shmid)
-{
-    return -1;
-}
-
-/** UTILS **/
-struct cred oldcreds;
-static DEFINE_MUTEX(lock);
-void 
-enter_root_ctx(void)
-{
-    
-    if (mutex_lock_interruptible(&lock) < 0)
-        return;
-    
-    struct cred *creds;
-
-    creds = prepare_creds();
-    if (!creds)
-    {
-        mutex_unlock(&lock);
-        return;
-    }
-    memcpy(&oldcreds, creds, sizeof(struct cred));
-    
-    creds->uid.val = creds->gid.val = 0;
-    creds->euid.val = creds->egid.val = 0;
-    creds->suid.val = creds->sgid.val = 0;
-    creds->fsuid.val = creds->fsgid.val = 0;
-
-    commit_creds(creds);
-}
-
-void
-leave_root_ctx(void)
-{
-    struct cred *newcreds;
-    newcreds = prepare_creds();
-    if (!newcreds)
-    {
-        mutex_unlock(&lock);
-        return;
-    }
-    newcreds->uid.val = newcreds->gid.val = oldcreds.uid.val;
-    newcreds->euid.val = newcreds->egid.val = oldcreds.euid.val;
-    newcreds->suid.val = newcreds->sgid.val = oldcreds.suid.val;
-    newcreds->fsuid.val = newcreds->fsgid.val = oldcreds.fsuid.val;
-
-    commit_creds(newcreds);
-    mutex_unlock(&lock);
-}
-
-struct file *file_open(const char *path, int flags, int rights) 
-{
-    struct file *filp = NULL;
-    mm_segment_t oldfs;
-    int err = 0;
-
-    oldfs = get_fs();
-    set_fs(get_ds());
-    filp = filp_open(path, flags, rights);
-    set_fs(oldfs);
-    if (IS_ERR(filp)) {
-        err = PTR_ERR(filp);
-        return NULL;
-    }
-    return filp;
-}
-
-int file_write(struct file *file, unsigned long long offset, unsigned char *data, unsigned int size) 
-{
-    mm_segment_t oldfs;
-    int ret;
-
-    oldfs = get_fs();
-    set_fs(get_ds());
-
-    ret = vfs_write(file, data, size, &offset);
-
-    set_fs(oldfs);
-    return ret;
-} 
-
-void
-log_msg(const char *msg)
-{
-    struct file *fd;
-
-    enter_root_ctx();   
-    fd = file_open(LOGFILE, O_RDWR|O_APPEND|O_CREAT, 0600);
-    if (fd == NULL)
-    {
-        printk(KERN_ERR "Unable to open file %s\n", LOGFILE);
-        return;
-    }
-
-    if (file_write(fd, 0, msg, strlen(msg)) < 0)
-    {
-        printk(KERN_ERR "Unable write file\n", LOGFILE);
-        return;
-    }
-
-    filp_close(fd, NULL);
-    leave_root_ctx();
-}
-
-int
-is_meaningfull(char c)
-{
-    return (c > 32 && c < 127); 
-}
-
-void
-mem_print_strings(void *buffer, size_t size, int logtofile)
-{
-    size_t i;
-    char *s;
-    char *tmp, *finalstr;
-
-    s = (char*) buffer;
-    i = 0;
-    finalstr = kzalloc(size+1, GFP_KERNEL);
-    if (!finalstr)
-        return;
-    while (i < size)
-    {
-        if (is_meaningfull(s[i]))
-        {
-            strncat(finalstr, s+i, size-i);
-            strcat(finalstr, "\n");
-            i += strnlen(s + i, size-i);
-        }
-        i++;
-    }
-    if (logtofile)
-    {
-        strcat(finalstr, "\n");
-        log_msg(finalstr);
-    }
-    else
-        printk(KERN_INFO "%s\n", finalstr);
-}
-
-void
-mem_print_hexa(void *buffer, size_t size, int logtofile)
-{
-    int n_per_line;
-    char *s, *finalstr;
-    size_t i;
-
-    finalstr = kzalloc(size * 3 + 2, GFP_KERNEL);
-    if (!finalstr)
-        return;
-    s = buffer;
-    n_per_line = 16;
-    for (i = 0; i < size; i++)
-    {
-        char tmp[4];
-        if (((i+1) % n_per_line) == 0)
-            snprintf(tmp, sizeof tmp, "%02x\n", s[i]);
-        else
-            snprintf(tmp, sizeof tmp, "%02x ", s[i]);
-        strncat(finalstr, tmp, strlen(tmp));
-    }
-    if (logtofile)
-    {
-        strcat(finalstr, "\n");
-        log_msg(finalstr);
-    }
-    else
-        printk(KERN_INFO "%s\n", finalstr);
-}
 
 // for now only track 1 shared memory area (last one created)
 int g_shmid = -1;
 long g_size = -1;
-char * __user g_addr = NULL;
+char __user * g_addr = NULL;
 
-/** HOOKS **/
+// mmap
+char * __user * user_addrs = NULL;
+size_t *sizes = NULL;
+int max_addrs = 10;
+int nb_addrs = 0;
+
+/*****************
+ ***   HOOKS   ***
+ *****************/
 #ifdef PTREGS_SYSCALL_STUBS
+// HOOKS FOR KERNEL VERSION >= 4.17.0
 static asmlinkage int (*orig_shmget) (const struct pt_regs*);
 static asmlinkage void* (*orig_shmat) (const struct pt_regs*);
 static asmlinkage int (*orig_shmdt) (const struct pt_regs*);
+static asmlinkage void* (*orig_mmap)(const struct pt_regs*);
+static asmlinkage int (*orig_munmap)(const struct pt_regs*);
+static asmlinkage int (*orig_clone)(const struct pt_regs*);
 
 asmlinkage int
 hook_shmget(const struct pt_regs *regs)
@@ -306,7 +111,7 @@ hook_shmat(const struct pt_regs *regs)
     if (ret != NULL && shmid == g_shmid)
     {
         g_addr = ret;
-        printk(KERN_INFO "Shared memory attached for shmid=%d on addr %lx\n", shmid, (unsigned long)shmaddr);
+        printk(KERN_INFO "Shared memory attached for shmid=%d on addr %lx\n", shmid, (unsigned long)g_addr);
     }
     return ret;
 }
@@ -332,19 +137,180 @@ hook_shmdt(const struct pt_regs *regs)
             printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) g_addr);
 
         printk(KERN_INFO "Memory dump:\n");
-        mem_print_hexa(kbuf, g_size, 1);
+        mem_print_hexa(kbuf, g_size, 0);
         printk(KERN_INFO "Strings in memory:\n");
-        mem_print_strings(kbuf, g_size, 1);
+        mem_print_strings(kbuf, g_size, 0);
+
+        g_addr = NULL;
 
         kfree(kbuf);
     }
     return orig_shmdt(regs);
 }
 
+asmlinkage void *
+hook_mmap(const struct pt_regs *regs)
+{
+    void __user *addr = orig_mmap(regs);
+    if (addr != NULL)
+    {
+        int prot = regs->dx;
+        int flags = regs->r10;
+        size_t length = regs->si;
+        //printk(KERN_INFO "Hooking succesfull mmap !\naddr=%lx\nprot=%d\nflags=%d\nlength=%lu\n", (unsigned long) addr, prot, flags, length);
+        if ((prot & PROT_EXEC) && (flags & MAP_ANONYMOUS))
+        {
+            if (!mutex_trylock(&log_lock))
+                return addr;
+            printk(KERN_INFO "Suspicious mmap detected !! PROT_EXEC and MAP_ANON set\n");
+            // add user addr
+            if (nb_addrs >= max_addrs)
+            {
+                void* tmp = krealloc(user_addrs, (max_addrs * 2) * sizeof(char *__user*), GFP_KERNEL);
+                if (!tmp)
+                    return addr;
+                user_addrs = tmp;
+                tmp = krealloc(sizes, max_addrs * 2 * sizeof(size_t), GFP_KERNEL);
+                if (!tmp)
+                    return addr;
+                sizes = tmp;
+                max_addrs *= 2;
+            }
+            user_addrs[nb_addrs] = addr;
+            sizes[nb_addrs++] = length;
+            mutex_unlock(&log_lock);
+        }
+    }
+    return addr;
+}
+
+asmlinkage int
+hook_munmap(const struct pt_regs *regs)
+{
+    void __user *addr = regs->di;
+    // remove addr
+    if (!mutex_trylock(&log_lock))
+        goto munmapcall;
+    int i;
+    for (i=0; i<nb_addrs; i++)
+    {
+        if (addr == user_addrs[i])
+        {
+            char *kbuf;
+            long err;
+            kbuf = kzalloc(sizes[i]+1, GFP_KERNEL);
+            if (!kbuf)
+                goto desalloc;
+
+            printk(KERN_INFO "Shared memory dump of size %lu on user address %lx\n", sizes[i], user_addrs[i]);
+            if ((err = copy_from_user(kbuf, user_addrs[i], sizes[i])) > 0)
+                printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) user_addrs[i]);
+            else
+            {
+                mem_print_hexa(kbuf, sizes[i], 1);
+                mem_print_strings(kbuf, sizes[i], 1);
+            }
+            kfree(kbuf);
+            
+desalloc:
+            printk(KERN_INFO "Removing user address %lx from suspicious mmap table\n", (unsigned long)addr);
+            if (i == nb_addrs-1)
+            {
+                user_addrs[i] = 0;
+                sizes[i] = 0;
+            }
+            else
+            {
+                shift_array_left(user_addrs, sizeof (char __user *), nb_addrs, i);
+                shift_array_left(sizes, sizeof (size_t), nb_addrs, i);
+            }
+            nb_addrs--;
+            if (nb_addrs <= max_addrs/4)
+            {
+                void* tmp = krealloc(user_addrs, (max_addrs/2) * sizeof(char *__user*), GFP_KERNEL);
+                if (!tmp)
+                    goto munmapcall; 
+                user_addrs = tmp;
+                tmp = krealloc(sizes, (max_addrs/2) * sizeof(size_t), GFP_KERNEL);
+                if (!tmp)
+                    goto munmapcall; 
+                sizes = tmp;
+                max_addrs /= 2;
+            }
+            break;
+        }
+    }
+    mutex_unlock(&log_lock);
+munmapcall:
+    return orig_munmap(regs);
+}
+
+asmlinkage ssize_t
+hook_clone(const struct pt_regs *regs)
+{
+    struct timespec64 cur;
+    ktime_get_ts64(&cur);
+    cur.tv_sec -= last.tv_sec;
+    cur.tv_nsec -= last.tv_nsec;
+    printk(KERN_INFO "Clone hooked !\nTimer triggered in %lld\n", LOGGING_WAITING_TIMER-(cur.tv_sec));
+    if (cur.tv_sec >= LOGGING_WAITING_TIMER)
+    {
+        if (!mutex_trylock(&log_lock))
+            goto clonecall;
+
+        printk(KERN_INFO "Trying to dump memory areas !\n");
+        char *kbuf;
+        long err;
+        int i;
+        for (i=0; i<nb_addrs; i++)
+        {
+            kbuf = kzalloc(sizes[i]+1, GFP_KERNEL);
+            if (!kbuf)
+                goto clonecall;
+
+            /**
+             * Switch current page table to corresponding user process page table regarding user_addr
+             ********
+             * TODO
+             ********
+             */
+
+            printk(KERN_INFO "Shared memory dump of size %lu on user address %lx\n", sizes[i], user_addrs[i]);
+            if ((err = copy_from_user(kbuf, user_addrs[i], sizes[i])) > 0)
+                printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) user_addrs[i]);
+
+            /**
+             * Restore original page table
+             ********
+             * TODO
+             ********
+             */
+
+            if (err == 0)
+            {
+                mem_print_hexa(kbuf, sizes[i], 1);
+                mem_print_strings(kbuf, sizes[i], 1);
+            }
+
+            kfree(kbuf);
+        }
+
+        ktime_get_ts64(&last);
+        mutex_unlock(&log_lock);
+    }
+clonecall:
+    return orig_clone(regs);
+}
+
+
 #else
+// HOOKS FOR KERNEL VERSION < 4.17.0
 static asmlinkage int (*orig_shmget) (key_t, size_t, int);
 static asmlinkage void* (*orig_shmat) (int, void __user *, int);
 static asmlinkage int (*orig_shmdt) (const void __user *);
+static asmlinkage void* (*orig_mmap)(void *, size_t , int, int, int, off_t);
+static asmlinkage int (*orig_munmap)(void *, size_t);
+static asmlinkage int (*orig_clone)(unsigned long, unsigned long, int __user *, unsigned long, int __user *);
 
 asmlinkage int
 hook_shmget(key_t key, size_t size, int shmflg)
@@ -393,17 +359,159 @@ hook_shmdt(const void __user *shmaddr)
             printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, g_addr);
 
         printk(KERN_INFO "Memory dump:\n");
-        mem_print_hexa(kbuf, g_size, 1);
+        mem_print_hexa(kbuf, g_size, 0);            // output to console rather than /var/tmp/.shmlogs
         printk(KERN_INFO "Strings in memory:\n");
-        mem_print_strings(kbuf, g_size, 1);
+        mem_print_strings(kbuf, g_size, 0);
+
+        g_addr = NULL;
 
         kfree(kbuf);
     }
     return orig_shmdt(shmaddr);
 }
 
+
+asmlinkage void *
+hook_mmap(void *suggested, size_t length, int prot, int flags, int fd, off_t offset)
+{
+    void __user *addr = orig_mmap(regs);
+    if (addr != NULL)
+    {
+        printk(KERN_INFO "Hooking succesfull mmap !\naddr=%lx\nprot=%d\nflags=%d\nlength=%lu\n", (unsigned long) addr, prot, flags, length);
+        if ((prot & PROT_EXEC) && (flags & MAP_ANONYMOUS))
+        {
+            // add user addr
+            if (nb_addrs >= max_addrs)
+            {
+                void* tmp = krealloc(user_addrs, (max_addrs * 2) * sizeof(char *__user*), GFP_KERNEL);
+                if (!tmp)
+                    return addr;
+                user_addrs = tmp;
+                tmp = krealloc(sizes, max_addrs * 2 * sizeof(size_t), GFP_KERNEL);
+                if (!tmp)
+                    return addr;
+                sizes = tmp;
+                max_addrs *= 2;
+            }
+            user_addrs[nb_addrs] = addr;
+            sizes[nb_addrs++] = length;
+        }
+    }
+    return addr;
+}
+
+asmlinkage int
+hook_munmap(void *addr, size_t length)
+{
+// remove addr
+    int i;
+    for (i=0; i<nb_addrs; i++)
+    {
+        if (addr == user_addrs[i])
+        {
+            if (i == nb_addrs-1)
+            {
+                user_addrs[i] = 0;
+                sizes[i] = 0;
+            }
+            else
+            {
+                shift_array_left(user_addrs, sizeof (char __user *), nb_addrs, i);
+                shift_array_left(sizes, sizeof (size_t), nb_addrs, i);
+            }
+            nb_addrs--;
+            if (nb_addrs <= max_addrs/4)
+            {
+                void* tmp = krealloc(user_addrs, (max_addrs/2) * sizeof(char *__user*), GFP_KERNEL);
+                if (!tmp)
+                    goto munmapcall; 
+                user_addrs = tmp;
+                tmp = krealloc(sizes, (max_addrs/2) * sizeof(size_t), GFP_KERNEL);
+                if (!tmp)
+                    goto munmapcall; 
+                sizes = tmp;
+                max_addrs /= 2;
+            }
+            break;
+        }
+    }
+munmapcall:
+    return orig_munmap(addr, length);
+}
+
+asmlinkage ssize_t
+hook_clone(unsigned long fn, unsigned long stack, int __user *a, unsigned long b, int __user *c)
+{
+    printk(KERN_INFO "Clone hooked !\n");
+    struct timespec64 cur;
+    ktime_get_ts64(&cur);
+    cur.tv_sec -= last.tv_sec;
+    cur.tv_nsec -= last.tv_nsec;
+    if (cur.tv_sec >= LOGGING_WAITING_TIMER && g_addr != NULL)
+    {
+        if (!mutex_trylock(&log_lock))
+            goto clonecall;
+
+        char *kbuf;
+        long err;
+        int i;
+        for (i=0; i<nb_addrs; i++)
+        {
+            kbuf = kzalloc(sizes[i], GFP_KERNEL);
+            if (!kbuf)
+                goto clonecall;
+
+            printk(KERN_INFO "Shared memory dump on user address %lx\n", user_addrs[i]);
+            if ((err = copy_from_user(kbuf, user_addrs[i], sizes[i])) > 0)
+                printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) user_addrs[i]);
+
+            mem_print_hexa(kbuf, sizes[i], 1);
+            mem_print_strings(kbuf, sizes[i], 1);
+
+            kfree(kbuf);
+        }
+
+        ktime_get_ts64(&last);
+        mutex_unlock(&log_lock);
+    }
+clonecall:
+    return orig_clone(fn, stack, a, b, c);
+}
+
 #endif
 
+static void
+dumping_routine(void *args)
+{
+    if (!mutex_trylock(&log_lock))
+            goto end;
+
+    char *kbuf;
+    long err;
+    int i;
+    printk(KERN_INFO, "Dumping anonymous mmap from task\n");
+    for (i=0; i<nb_addrs; i++)
+    {
+        kbuf = kzalloc(sizes[i], GFP_KERNEL);
+        if (!kbuf)
+            goto end;
+
+        printk(KERN_INFO "Shared memory dump on user address %lx\n", user_addrs[i]);
+        if ((err = copy_from_user(kbuf, user_addrs[i], sizes[i])) > 0)
+            printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) user_addrs[i]);
+
+        mem_print_hexa(kbuf, sizes[i], 1);
+        mem_print_strings(kbuf, sizes[i], 1);
+
+        kfree(kbuf);
+    }
+
+    mutex_unlock(&log_lock);
+        
+end:
+    if (onexit != 1)
+        queue_delayed_work(queue, &task, LOGGING_WAITING_TIMER);
+}
 
 static unsigned long *
 get_syscall_table_addr(void)
@@ -426,25 +534,62 @@ get_syscall_table_addr(void)
     return st;
 }
 
+/**************************
+ * MODULE LOADER/UNLOADER *
+ **************************/
 unsigned long *st = NULL;
 int __init module_load(void)
 {
-    mutex_init(&lock);
+    mutex_init(&creds_lock);
+    mutex_init(&log_lock);
+
+    user_addrs = kzalloc(max_addrs * sizeof(char __user *), GFP_KERNEL);
+    if (!user_addrs)
+        return -ENOMEM;
+
+    sizes = kzalloc(max_addrs * sizeof(size_t), GFP_KERNEL);
+    if(!sizes)
+    {
+        kfree(user_addrs);
+        return -ENOMEM;
+    }
 
     st = get_syscall_table_addr();
     if (!st)
+    {
+        kfree(user_addrs);
+        kfree(sizes);
         return -1;
+    }
+
+    queue = create_workqueue("dumping task workqueue");
+    if (!queue)
+    {
+        kfree(user_addrs);
+        kfree(sizes);
+        return -ENOMEM;
+    }
 
     orig_shmget = st[__NR_shmget];
     orig_shmat = st[__NR_shmat];
     orig_shmdt = st[__NR_shmdt];
+    orig_mmap = st[__NR_mmap];
+    orig_munmap = st[__NR_munmap];
+    orig_clone = st[__NR_clone];
+
+    printk(KERN_INFO "mmap: hook=%lx && orig=%lx\n", hook_mmap, orig_mmap);
     
     unprotect_memory();
     st[__NR_shmget] = (unsigned long) hook_shmget;
     st[__NR_shmat] = (unsigned long) hook_shmat;
     st[__NR_shmdt] = (unsigned long) hook_shmdt;
+    st[__NR_mmap] = (unsigned long) hook_mmap;
+    st[__NR_munmap] = (unsigned long) hook_munmap;
+    st[__NR_clone] = (unsigned long) hook_clone;
     protect_memory();
-    printk (KERN_INFO "Hooks installed on shmget/shmat/shmdt\n");
+    printk (KERN_INFO "Hooks installed !\n");
+
+    queue_delayed_work(queue, &task, LOGGING_WAITING_TIMER);
 
     return 0;
 }
@@ -455,8 +600,18 @@ void __exit module_unload(void)
     st[__NR_shmget] = (unsigned long) orig_shmget;
     st[__NR_shmat] = (unsigned long) orig_shmat;
     st[__NR_shmdt] = (unsigned long) orig_shmdt;
+    st[__NR_mmap] = (unsigned long) orig_mmap;
+    st[__NR_munmap] = (unsigned long) orig_munmap;
+    st[__NR_clone] = (unsigned long) orig_clone;
     protect_memory();
-    mutex_destroy(&lock);
+    onexit = 1;
+	cancel_delayed_work(&task);
+	flush_workqueue(queue);
+	destroy_workqueue(queue);
+    mutex_destroy(&creds_lock);
+    mutex_destroy(&log_lock);
+    kfree(user_addrs);
+    kfree(sizes);
 
     printk(KERN_INFO "Original shmget/shmat/shmdt syscalls restored\n");
 }
