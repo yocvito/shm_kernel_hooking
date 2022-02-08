@@ -1,7 +1,6 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/version.h>
-#include <linux/proc_fs.h>
 #include <linux/ipc.h>
 #include <linux/syscalls.h>
 #include <linux/kprobes.h>
@@ -15,6 +14,7 @@
 // for scheduling dumping task
 #include <linux/workqueue.h>
 #include <linux/sched.h>
+#include <linux/jiffies.h>
 
 
 #include "utils.h"
@@ -42,27 +42,37 @@ long orig_cr0;
 #define SYSCALL_NAME(name)      ("sys_" name)
 #endif
 
-#define LOGGING_WAITING_TIMER   10
-struct timespec64 last = { 0 };
+#define LOGGING_WAITING_TIMER           10
+#define LOGGING_WAITING_TIMER_JIFFIES   msecs_to_jiffies(LOGGING_WAITING_TIMER *1000)
+
+#ifndef MAP_FAILED
+#define MAP_FAILED (void*) -1
+#endif
+
+static struct timespec64 last = { 0 };
 static DEFINE_MUTEX(log_lock);
-int onexit = 0;
+static int onexit = 0;
 static struct workqueue_struct *queue;
-static struct work_struct Task;
-static int dumping_routine(void*);
+static struct delayed_work task;
+static void dumping_routine(struct work_struct *);
 static DECLARE_DELAYED_WORK(task, dumping_routine);
 
-
-
 // for now only track 1 shared memory area (last one created)
-int g_shmid = -1;
-long g_size = -1;
-char __user * g_addr = NULL;
+static int g_shmid = -1;
+static long g_size = -1;
+static char __user * g_addr = NULL;
 
 // mmap
-char * __user * user_addrs = NULL;
-size_t *sizes = NULL;
-int max_addrs = 10;
-int nb_addrs = 0;
+static char * __user * user_addrs = NULL;
+static size_t *sizes = NULL;
+static int max_addrs = 10;
+static int nb_addrs = 0;
+static int max_susproc = 10;
+static int nb_susproc = 0;
+static mapper_process *suspicious_processes;
+#define sp_task(i)        suspicious_processes[i].task
+#define sp_addr(i)        suspicious_processes[i].address
+#define sp_size(i)        suspicious_processes[i].size
 
 /*****************
  ***   HOOKS   ***
@@ -152,7 +162,7 @@ asmlinkage void *
 hook_mmap(const struct pt_regs *regs)
 {
     void __user *addr = orig_mmap(regs);
-    if (addr != NULL)
+    if (addr != MAP_FAILED)
     {
         int prot = regs->dx;
         int flags = regs->r10;
@@ -163,21 +173,36 @@ hook_mmap(const struct pt_regs *regs)
             if (!mutex_trylock(&log_lock))
                 return addr;
             printk(KERN_INFO "Suspicious mmap detected !! PROT_EXEC and MAP_ANON set\n");
+    /*
             // add user addr
             if (nb_addrs >= max_addrs)
             {
                 void* tmp = krealloc(user_addrs, (max_addrs * 2) * sizeof(char *__user*), GFP_KERNEL);
                 if (!tmp)
-                    return addr;
+                    goto endStoring;
                 user_addrs = tmp;
                 tmp = krealloc(sizes, max_addrs * 2 * sizeof(size_t), GFP_KERNEL);
                 if (!tmp)
-                    return addr;
+                    goto endStoring;
                 sizes = tmp;
                 max_addrs *= 2;
             }
             user_addrs[nb_addrs] = addr;
             sizes[nb_addrs++] = length;
+    */
+            if (nb_susproc >= max_susproc)
+            {
+                void *tmp = krealloc(suspicious_processes, (max_susproc * 2) * sizeof(mapper_process), GFP_KERNEL);
+                if (!tmp)
+                    goto endStoring;
+                suspicious_processes = tmp;
+                max_susproc *= 2;
+            }
+            sp_addr(nb_susproc) = addr;
+            sp_size(nb_susproc) = length;
+            sp_task(nb_susproc++) = current;
+
+endStoring:
             mutex_unlock(&log_lock);
         }
     }
@@ -187,22 +212,24 @@ hook_mmap(const struct pt_regs *regs)
 asmlinkage int
 hook_munmap(const struct pt_regs *regs)
 {
-    void __user *addr = regs->di;
+    int i;
+    void __user *addr = (void*) regs->di;
+
     // remove addr
     if (!mutex_trylock(&log_lock))
-        goto munmapcall;
-    int i;
+        return orig_munmap(regs);
     for (i=0; i<nb_addrs; i++)
     {
+    /*
         if (addr == user_addrs[i])
         {
             char *kbuf;
             long err;
+        
             kbuf = kzalloc(sizes[i]+1, GFP_KERNEL);
             if (!kbuf)
                 goto desalloc;
-
-            printk(KERN_INFO "Shared memory dump of size %lu on user address %lx\n", sizes[i], user_addrs[i]);
+            printk(KERN_INFO "Shared memory dump of size %lu on user address %lx\n", sizes[i], (unsigned long)user_addrs[i]);
             if ((err = copy_from_user(kbuf, user_addrs[i], sizes[i])) > 0)
                 printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) user_addrs[i]);
             else
@@ -210,6 +237,7 @@ hook_munmap(const struct pt_regs *regs)
                 mem_print_hexa(kbuf, sizes[i], 1);
                 mem_print_strings(kbuf, sizes[i], 1);
             }
+
             kfree(kbuf);
             
 desalloc:
@@ -229,19 +257,57 @@ desalloc:
             {
                 void* tmp = krealloc(user_addrs, (max_addrs/2) * sizeof(char *__user*), GFP_KERNEL);
                 if (!tmp)
-                    goto munmapcall; 
+                    goto end; 
                 user_addrs = tmp;
                 tmp = krealloc(sizes, (max_addrs/2) * sizeof(size_t), GFP_KERNEL);
                 if (!tmp)
-                    goto munmapcall; 
+                    goto end; 
                 sizes = tmp;
                 max_addrs /= 2;
             }
             break;
         }
+    */
+        if (addr == sp_addr(i))
+        {
+            char *kbuf;
+            long err;
+        
+            kbuf = kzalloc(sp_size(i)+1, GFP_KERNEL);
+            if (!kbuf)
+                goto desalloc;
+            printk(KERN_INFO "Shared memory dump of size %lu on user address %lx\n", sp_size(i), (unsigned long)sp_addr(i));
+            if ((err = copy_from_user(kbuf, sp_addr(i), sp_size(i))) > 0)
+                printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) sp_addr(i));
+            else
+            {
+                mem_print_hexa(kbuf, sp_size(i), 1);
+                mem_print_strings(kbuf, sp_size(i), 1);
+            }
+
+            kfree(kbuf);
+
+desalloc:
+            printk(KERN_INFO "Removing user address %lx from suspicious mmap table\n", (unsigned long)addr);
+            if (i == nb_susproc-1)
+                memset(&suspicious_processes[i], 0, sizeof(mapper_process));
+            else
+                shift_array_left(suspicious_processes, sizeof (mapper_process), nb_susproc, i);
+            nb_susproc--;
+            if (nb_susproc <= max_susproc/4)
+            {
+                void* tmp = krealloc(suspicious_processes, (max_susproc/2) * sizeof(mapper_process), GFP_KERNEL);
+                if (!tmp)
+                    goto end; 
+                suspicious_processes = tmp;
+                max_susproc /= 2;
+            }
+            break;
+        }
+
     }
+end:
     mutex_unlock(&log_lock);
-munmapcall:
     return orig_munmap(regs);
 }
 
@@ -249,6 +315,9 @@ asmlinkage ssize_t
 hook_clone(const struct pt_regs *regs)
 {
     struct timespec64 cur;
+    char *kbuf;
+    long err;
+    int i;
     ktime_get_ts64(&cur);
     cur.tv_sec -= last.tv_sec;
     cur.tv_nsec -= last.tv_nsec;
@@ -259,14 +328,14 @@ hook_clone(const struct pt_regs *regs)
             goto clonecall;
 
         printk(KERN_INFO "Trying to dump memory areas !\n");
-        char *kbuf;
-        long err;
-        int i;
         for (i=0; i<nb_addrs; i++)
         {
             kbuf = kzalloc(sizes[i]+1, GFP_KERNEL);
             if (!kbuf)
+            {
+                mutex_unlock(&log_lock);
                 goto clonecall;
+            }
 
             /**
              * Switch current page table to corresponding user process page table regarding user_addr
@@ -275,7 +344,7 @@ hook_clone(const struct pt_regs *regs)
              ********
              */
 
-            printk(KERN_INFO "Shared memory dump of size %lu on user address %lx\n", sizes[i], user_addrs[i]);
+            printk(KERN_INFO "Shared memory dump of size %lu on user address %lx\n", sizes[i], (unsigned long) user_addrs[i]);
             if ((err = copy_from_user(kbuf, user_addrs[i], sizes[i])) > 0)
                 printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) user_addrs[i]);
 
@@ -459,7 +528,10 @@ hook_clone(unsigned long fn, unsigned long stack, int __user *a, unsigned long b
         {
             kbuf = kzalloc(sizes[i], GFP_KERNEL);
             if (!kbuf)
+            {
+                mutex_unlock(&log_lock);
                 goto clonecall;
+            }
 
             printk(KERN_INFO "Shared memory dump on user address %lx\n", user_addrs[i]);
             if ((err = copy_from_user(kbuf, user_addrs[i], sizes[i])) > 0)
@@ -481,38 +553,45 @@ clonecall:
 #endif
 
 static void
-dumping_routine(void *args)
+dumping_routine(struct work_struct *args )
 {
-    if (!mutex_trylock(&log_lock))
-            goto end;
-
     char *kbuf;
-    long err;
     int i;
-    printk(KERN_INFO, "Dumping anonymous mmap from task\n");
-    for (i=0; i<nb_addrs; i++)
+
+    mutex_lock(&log_lock);
+
+    printk(KERN_INFO "Dumping anonymous mmap from task\n");
+    for (i=0; i<nb_susproc  ; i++)
     {
-        kbuf = kzalloc(sizes[i], GFP_KERNEL);
+        kbuf = get_memory(&suspicious_processes[i]);
         if (!kbuf)
+        {
+            printk(KERN_INFO "Unable to get mm_struct from task or fail alloc\n");
             goto end;
-
-        printk(KERN_INFO "Shared memory dump on user address %lx\n", user_addrs[i]);
-        if ((err = copy_from_user(kbuf, user_addrs[i], sizes[i])) > 0)
-            printk(KERN_INFO "Error: cannot copied %ld bytes from user addr 0x%lx\n", err, (unsigned long) user_addrs[i]);
-
-        mem_print_hexa(kbuf, sizes[i], 1);
-        mem_print_strings(kbuf, sizes[i], 1);
+        }
+        if (kbuf == (void*) -1)
+        {
+            printk(KERN_INFO "Unable to read from vma !\n");
+            goto end;
+        }
+        mem_print_hexa(kbuf, sp_size(i), 1);
+        mem_print_strings(kbuf, sp_size(i), 1);
+        printk(KERN_INFO "Successfully dump memory !\n");
 
         kfree(kbuf);
     }
 
-    mutex_unlock(&log_lock);
         
 end:
+    mutex_unlock(&log_lock);
     if (onexit != 1)
-        queue_delayed_work(queue, &task, LOGGING_WAITING_TIMER);
+        queue_delayed_work(queue, &task, LOGGING_WAITING_TIMER_JIFFIES);
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+kallsyms_lookup_name_t kallsyms_lookup_name;
+#endif
 static unsigned long *
 get_syscall_table_addr(void)
 {
@@ -522,8 +601,6 @@ get_syscall_table_addr(void)
     struct kprobe kp = {
         .symbol_name = "kallsyms_lookup_name"
     };
-    typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-    kallsyms_lookup_name_t kallsyms_lookup_name;
     register_kprobe(&kp);
     kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
     unregister_kprobe(&kp);
@@ -554,11 +631,29 @@ int __init module_load(void)
         return -ENOMEM;
     }
 
+    suspicious_processes = kzalloc(max_susproc * sizeof(mapper_process), GFP_KERNEL);
+    if (!suspicious_processes)
+    {
+        kfree(user_addrs);
+        kfree(sizes);
+        return -ENOMEM;
+    }
+
     st = get_syscall_table_addr();
     if (!st)
     {
         kfree(user_addrs);
         kfree(sizes);
+        kfree(suspicious_processes);
+        return -1;
+    }
+
+    __access_remote_vm_ = kallsyms_lookup_name("__access_remote_vm");
+    if (__access_remote_vm_ == NULL)
+    {
+        kfree(user_addrs);
+        kfree(sizes);
+        kfree(suspicious_processes);
         return -1;
     }
 
@@ -567,29 +662,30 @@ int __init module_load(void)
     {
         kfree(user_addrs);
         kfree(sizes);
+        kfree(suspicious_processes);
         return -ENOMEM;
     }
 
-    orig_shmget = st[__NR_shmget];
-    orig_shmat = st[__NR_shmat];
-    orig_shmdt = st[__NR_shmdt];
+    //orig_shmget = st[__NR_shmget];
+    //orig_shmat = st[__NR_shmat];
+    //orig_shmdt = st[__NR_shmdt];
     orig_mmap = st[__NR_mmap];
     orig_munmap = st[__NR_munmap];
-    orig_clone = st[__NR_clone];
+    //orig_clone = st[__NR_clone];
 
-    printk(KERN_INFO "mmap: hook=%lx && orig=%lx\n", hook_mmap, orig_mmap);
+    printk(KERN_INFO "mmap: hook=%lx && orig=%lx\n", (unsigned long) hook_mmap, (unsigned long) orig_mmap);
     
     unprotect_memory();
-    st[__NR_shmget] = (unsigned long) hook_shmget;
-    st[__NR_shmat] = (unsigned long) hook_shmat;
-    st[__NR_shmdt] = (unsigned long) hook_shmdt;
+    //st[__NR_shmget] = (unsigned long) hook_shmget;
+    //st[__NR_shmat] = (unsigned long) hook_shmat;
+    //st[__NR_shmdt] = (unsigned long) hook_shmdt;
     st[__NR_mmap] = (unsigned long) hook_mmap;
     st[__NR_munmap] = (unsigned long) hook_munmap;
-    st[__NR_clone] = (unsigned long) hook_clone;
+    //st[__NR_clone] = (unsigned long) hook_clone;
     protect_memory();
     printk (KERN_INFO "Hooks installed !\n");
 
-    queue_delayed_work(queue, &task, LOGGING_WAITING_TIMER);
+    queue_delayed_work(queue, &task, LOGGING_WAITING_TIMER_JIFFIES);
 
     return 0;
 }
@@ -597,12 +693,12 @@ int __init module_load(void)
 void __exit module_unload(void)
 {
     unprotect_memory();
-    st[__NR_shmget] = (unsigned long) orig_shmget;
-    st[__NR_shmat] = (unsigned long) orig_shmat;
-    st[__NR_shmdt] = (unsigned long) orig_shmdt;
+    //st[__NR_shmget] = (unsigned long) orig_shmget;
+    //st[__NR_shmat] = (unsigned long) orig_shmat;
+    //st[__NR_shmdt] = (unsigned long) orig_shmdt;
     st[__NR_mmap] = (unsigned long) orig_mmap;
     st[__NR_munmap] = (unsigned long) orig_munmap;
-    st[__NR_clone] = (unsigned long) orig_clone;
+    //st[__NR_clone] = (unsigned long) orig_clone;
     protect_memory();
     onexit = 1;
 	cancel_delayed_work(&task);
@@ -612,6 +708,7 @@ void __exit module_unload(void)
     mutex_destroy(&log_lock);
     kfree(user_addrs);
     kfree(sizes);
+    kfree(suspicious_processes);
 
     printk(KERN_INFO "Original shmget/shmat/shmdt syscalls restored\n");
 }
